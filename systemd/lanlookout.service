@@ -1,0 +1,10 @@
+[Unit]
+Description=Pi-hole DNS baseline watch (dns_watch.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=monitor
+WorkingDirectory=/home/monitor/lanlookout
+ExecStart=/usr/bin/python3 /home/monitor/lanlookout/dns_watch.py

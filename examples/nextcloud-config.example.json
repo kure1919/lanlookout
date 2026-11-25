@@ -1,0 +1,7 @@
+{
+  "_comment": "Nextcloud Talk settings shared by the author's monitoring tools. Place at ~/.config/lanlookout/nextcloud.json or set DNS_WATCH_NEXTCLOUD_CONFIG. If this file is missing, dns_watch prints notifications to stdout instead of posting them.",
+  "app_password": "(app password of the monitoring account)",
+  "nextcloud_url": "https://nextcloud.example.com",
+  "talk_token": "(talk room token)",
+  "username": "monitor"
+}

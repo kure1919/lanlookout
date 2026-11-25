@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+# Real deployment files must never be committed: the device name registry
+# is your home's device inventory, the config files contain hostnames and
+# credentials, and the state DB is your household's DNS history.
+config.json
+device_names.json
+nextcloud-config.json
+*.db
+state/

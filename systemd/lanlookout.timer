@@ -1,0 +1,10 @@
+[Unit]
+Description=Run dns_watch every 30 minutes
+
+[Timer]
+OnCalendar=*:7,37
+Persistent=true
+Unit=lanlookout.service
+
+[Install]
+WantedBy=timers.target
