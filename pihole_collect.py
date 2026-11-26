@@ -39,7 +39,11 @@ def open_db(path):
     try:
         return sqlite3.connect("file:%s?mode=ro" % path, uri=True)
     except sqlite3.Error:
-        return sqlite3.connect(path)
+        db = sqlite3.connect(path)
+        # フォールバックでも書き込みはしない。query_only を明示して
+        # 「読み取り専用監視」の保証を接続レベルで担保する。
+        db.execute("PRAGMA query_only = ON")
+        return db
 
 
 def table_names(db):
@@ -182,7 +186,16 @@ def collect(db, start, end):
         GROUP BY 1, 2
     """.format(client=client_expr, nx=nx_expr, frm=from_sql)
     hourly = [list(r) for r in db.execute(hourly_sql, (start, end)).fetchall()]
-    return {"pairs": pairs, "hourly": hourly, "client_info": client_info(db)}
+    out = {"pairs": pairs, "hourly": hourly, "client_info": client_info(db)}
+    if not has_reply:
+        # reply_type が無い DB では NX を数えられない。0 を黙って返すと
+        # 「静か」と「測れていない」が区別できなくなるので、警告として
+        # 呼び出し側に伝える（NX 系の検知はこのノードでは盲目になる）。
+        out["warnings"] = [
+            "no reply_type column: NXDOMAIN counts are 0 on this node; "
+            "NX-based detection is blind here"
+        ]
+    return out
 
 
 def dump_schema(db):

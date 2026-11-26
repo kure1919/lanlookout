@@ -63,6 +63,22 @@ firewall state. The optional activeban bridge is append-only
 reporting over an SSH forced command — a one-way output, like the
 Talk notification, that cannot reach back into the monitor.
 
+### Device identity and its limits
+
+Devices are identified by MAC address (learned from the Pi-hole data
+and ARP), because IPs are reassigned by DHCP. Two honest limits:
+
+- Attribution is an approximation. Collection aggregates by IP, so
+  when an IP changes hands inside a collection window, the window's
+  traffic is attributed to the device that held the IP at the first
+  query. DHCP reservations for fixed devices keep this rare in
+  practice; treat identity as strong evidence, not proof.
+- MACs can be randomized and spoofed. Phones randomize per network
+  by default (stable on your own SSID, so home devices stay
+  trackable), and a device already on the LAN can spoof another
+  device's MAC. An attacker doing that is an active, targeted
+  adversary — outside what this system is designed to handle.
+
 ## The canary probe
 
 If the activeban bridge is enabled, the whole response chain can be

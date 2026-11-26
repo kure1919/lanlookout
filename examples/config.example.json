@@ -1,33 +1,36 @@
 {
-  "_comment": "dns_watch configuration. Place at ~/.config/lanlookout/config.json (or set DNS_WATCH_CONFIG). Nextcloud credentials do NOT belong here; see nextcloud-config.example.json.",
-  "activeban": {
-    "_comment": "Optional bridge to activeban. Only dangerous signals (report_kinds) and the canary probe are reported; NEW_PAIR / NEW_CLIENT are discovery signals and are never reported. ssh_host is the activeban host's forced-command account.",
-    "canary": true,
-    "canary_ttl_seconds": 300,
-    "enabled": false,
-    "report_kinds": [
-      "NX_SPIKE"
-    ],
-    "ssh_host": "qdetect@activeban-host",
-    "ssh_key": "",
-    "ttl_seconds": 21600
-  },
-  "arp_learn": true,
-  "arp_sweep": true,
-  "device_names_path": "~/.config/lanlookout/device_names.json",
-  "ftl_db": "/srv/pi-hole/etc-pihole/pihole-FTL.db",
-  "ignore_clients": [],
-  "ignore_domain_patterns": [
-    "*.prod.do.dsp.mp.microsoft.com",
-    "*.googlevideo.com"
+ "_comment": "dns_watch configuration. Place at ~/.config/lanlookout/config.json (or set DNS_WATCH_CONFIG). Nextcloud credentials do NOT belong here; see nextcloud-config.example.json.",
+ "activeban": {
+  "_comment": "Optional bridge to activeban. Only dangerous signals (report_kinds) and the canary probe are reported; NEW_PAIR / NEW_CLIENT are discovery signals and are never reported. ssh_host is the activeban host's forced-command account.",
+  "canary": true,
+  "canary_ttl_seconds": 300,
+  "enabled": false,
+  "report_kinds": [
+   "NX_SPIKE"
   ],
-  "ignore_new_pair": [],
-  "new_pair_max_client_pairs": 400,
-  "nodes": [
-    "pihole1",
-    "pihole2"
-  ],
-  "ssh_user": "ansible",
-  "state_path": "~/.local/state/dns-watch/state.db",
-  "use_sudo": false
+  "ssh_host": "qdetect@activeban-host",
+  "ssh_key": "",
+  "ttl_seconds": 21600
+ },
+ "arp_learn": true,
+ "arp_sweep": true,
+ "device_names_path": "~/.config/lanlookout/device_names.json",
+ "ftl_db": "/srv/pi-hole/etc-pihole/pihole-FTL.db",
+ "ignore_clients": [],
+ "ignore_domain_patterns": [
+  "*.prod.do.dsp.mp.microsoft.com",
+  "*.googlevideo.com"
+ ],
+ "ignore_new_pair": [],
+ "new_pair_max_client_pairs": 400,
+ "nodes": [
+  "pihole1",
+  "pihole2"
+ ],
+ "ssh_user": "ansible",
+ "state_path": "~/.local/state/dns-watch/state.db",
+ "use_sudo": false,
+ "new_pair_window_days": 90,
+ "retention_days": 180,
+ "hourly_retention_days": 40
 }

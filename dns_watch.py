@@ -138,9 +138,16 @@ def _load_config():
         # 学習の前に自ネットへ UDP プローブを送って ARP テーブルを温める。
         "arp_sweep": bool(cfg.get("arp_sweep", True)),
         # NEW_PAIR は「宛先集合が小さい機器らしいクライアント」にだけ適用する。
-        # 30日間の宛先ペア数がこれを超えるクライアントは人間の端末とみなして
-        # 除外する（人間は毎日100件以上の新規ドメインを踏むので検知にならない）。
+        # 直近 new_pair_window_days 日に観測された宛先ペア数がこれを超える
+        # クライアントは人間の端末とみなして除外する（人間は毎日100件以上
+        # の新規ドメインを踏むので検知にならない）。生涯累計で数えると、
+        # 宛先が少しずつ増える IoT がいずれ永久に対象外になるため窓で数える。
         "new_pair_max_client_pairs": int(cfg.get("new_pair_max_client_pairs", 400)),
+        "new_pair_window_days": int(cfg.get("new_pair_window_days", 90)),
+        # ベースラインの保持期間。これより古い pairs / id_pairs と hourly
+        # は実行時に捨てる（ベースラインは最近の姿であって生涯記録ではない）。
+        "retention_days": int(cfg.get("retention_days", 180)),
+        "hourly_retention_days": int(cfg.get("hourly_retention_days", 40)),
         # activeban への橋渡し（任意・既定は無効）。dns_watch は読み取り
         # 専用のまま、危険シグナルだけを SSH forced-command 経由で
         # activeban に report する。NEW_PAIR / NEW_CLIENT は発見
@@ -237,6 +244,10 @@ def collect_all(start, end):
     info = {}    # client ip -> {"name": ..., "mac": ...}
     for node in CONFIG["nodes"]:
         data = collect(node, start, end)
+        for w in data.get("warnings") or []:
+            # 収集側の警告（例: NX が測れないスキーマ）は握り潰さず、
+            # ジャーナルに残す。「静か」と「測れていない」を区別するため。
+            print("collector warning (%s): %s" % (node, w), file=sys.stderr)
         for ip, entry in (data.get("client_info") or {}).items():
             cur = info.setdefault(ip, {"name": "", "mac": ""})
             if entry.get("name"):
@@ -782,6 +793,8 @@ def check_new_pairs(conn, now, skip_identities=frozenset()):
 
     id_pairs は端末の全 IP 時代を通した履歴なので、DHCP の引っ越しや
     使い回し IP への移動では、既知の宛先が「新規」に化けることはない。
+    「機器らしい」判定の宛先数は直近 new_pair_window_days 日の窓で数える
+    （生涯累計だと、宛先が少しずつ増える IoT が永久に対象外になる）。
     """
     findings = []  # (identity, kind, akey, text)
     rows = conn.execute(
@@ -789,10 +802,13 @@ def check_new_pairs(conn, now, skip_identities=frozenset()):
         SELECT identity, domain, recent_count FROM id_pairs
         WHERE first_seen >= ? AND recent_count >= ?
           AND domain LIKE '%.%'
-          AND (SELECT COUNT(*) FROM id_pairs q WHERE q.identity = id_pairs.identity) <= ?
+          AND (SELECT COUNT(*) FROM id_pairs q
+               WHERE q.identity = id_pairs.identity AND q.last_seen >= ?) <= ?
         ORDER BY identity, recent_count DESC
         """,
-        (now - DAY, NEW_PAIR_MIN_COUNT, CONFIG["new_pair_max_client_pairs"]),
+        (now - DAY, NEW_PAIR_MIN_COUNT,
+         now - CONFIG["new_pair_window_days"] * DAY,
+         CONFIG["new_pair_max_client_pairs"]),
     ).fetchall()
     by_id = {}
     for ident, domain, count in rows:
@@ -1218,6 +1234,22 @@ def _open_state():
     return conn
 
 
+def prune_state(conn, now):
+    """古い履歴を捨てる。ベースラインは「最近の姿」であって生涯記録ではない。
+
+    pairs / id_pairs は last_seen が保持期間（既定180日）を超えた行を、
+    hourly は夜間判定が参照する数週間分（既定40日）を残して削除する。
+    保持期間を長く取ってあるので、消えた宛先の再出現が「新規」として
+    光るのは稀で、意味論としても正しい（半年消えていた宛先は新規同然）。
+    破壊的なので dry-run では実行しない。
+    """
+    pair_cut = now - CONFIG["retention_days"] * DAY
+    conn.execute("DELETE FROM pairs WHERE last_seen < ?", (pair_cut,))
+    conn.execute("DELETE FROM id_pairs WHERE last_seen < ?", (pair_cut,))
+    hour_cut = now - CONFIG["hourly_retention_days"] * DAY
+    conn.execute("DELETE FROM hourly WHERE hour < ?", (hour_cut,))
+
+
 def run(now, bootstrap=False, dry_run=False):
     global HONOR_ALERTS
     # dry-run はプレビュー専用: alerts の抑制を見ず、今マッチする所見を
@@ -1225,6 +1257,11 @@ def run(now, bootstrap=False, dry_run=False):
     HONOR_ALERTS = not dry_run
     span = BOOTSTRAP_DAYS * DAY if bootstrap else RECENT_HOURS * HOUR
     start, end = now - span, now
+    if not bootstrap:
+        # 窓の開始を時間境界に切り下げる。部分的な先頭バケットが hourly
+        # の確定値を上書きして痩せさせるのを防ぐ（収集は最大で1時間弱
+        # 長くなるが、merge は時間帯ごとの確定値の置換なので安全）。
+        start -= start % HOUR
 
     # 収集を先に全部済ませ、ノード間で合算する。1台でも失敗したら
     # state を進めずに異常終了。
@@ -1250,6 +1287,9 @@ def run(now, bootstrap=False, dry_run=False):
             print("bootstrap done: pairs=%d clients=%d" % (n_pairs, n_clients))
             return 0
 
+        if not dry_run:
+            prune_state(conn, now)
+
         findings = []
         findings += check_new_clients(conn, now)
         new_ids = {f[0] for f in findings if f[1] == "NEW_CLIENT"}
@@ -1269,8 +1309,12 @@ def run(now, bootstrap=False, dry_run=False):
             ]
 
         if not findings:
-            # 所見が無くてもカナリアだけは橋渡しする（動作確認プローブ）
-            bridge_to_activeban(conn, [], now)
+            # 所見が無くてもカナリアだけは橋渡しする（動作確認プローブ）。
+            # ただし dry-run はプレビューなので、外部への送信は一切しない
+            # （以前はこの分岐だけ dry_run を見ておらず、カナリア経由で
+            # 本物の BAN を飛ばし得た）。
+            if not dry_run:
+                bridge_to_activeban(conn, [], now)
             conn.commit()
             return 0
 
