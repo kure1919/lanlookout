@@ -93,6 +93,12 @@ The probe's design and the receiving side are specified in §7
 
 ## Quick start
 
+Shortcut: `sh install.sh` (run as the user who will run the monitor)
+creates the config and state directories, copies the example config,
+and generates + installs the systemd units with your user name and
+install path substituted. Steps 2, 3 and 6 below are what it does;
+the rest is the same either way.
+
 1. Python 3 on the monitoring host; SSH access to your Pi-hole
    node(s) for a user that can read the FTL database (or use sudo:
    `use_sudo`).
@@ -116,7 +122,8 @@ The probe's design and the receiving side are specified in §7
    python3 dns_watch.py               # a normal run
    ```
 
-6. Run it every 30 minutes (`systemd/lanlookout.timer` is included).
+6. Run it every 30 minutes (the `lanlookout.timer` unit template is
+   in `systemd/`; `install.sh` generates the real unit from it).
    If notification delivery fails, the run exits non-zero **without
    advancing state**, so the next run retries — alerts are not lost.
 7. Optional — to also report to an activeban host: in `config.json`,

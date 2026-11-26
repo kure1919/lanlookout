@@ -5,6 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=monitor
-WorkingDirectory=/home/monitor/lanlookout
-ExecStart=/usr/bin/python3 /home/monitor/lanlookout/dns_watch.py
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=/usr/bin/python3 __INSTALL_DIR__/dns_watch.py
