@@ -65,37 +65,42 @@ def _text_column(db, table):
     return "id"
 
 
-def _link_column(db, table, by_table, candidates):
-    """table 側で by_table を参照しているカラム名を返す。
-
-    優先順位: PRAGMA foreign_key_list の宣言 → 候補名の一致。
-    見つからなければ None。
-    """
+def _fk_column(db, table, by_table):
+    """PRAGMA foreign_key_list で by_table を参照すると宣言されたカラム。"""
     try:
         for row in db.execute("PRAGMA foreign_key_list(%s)" % table):
             if row[2] == by_table:  # (id, seq, table, from, to, ...)
                 return row[3]
     except sqlite3.Error:
         pass
-    cols = set(columns(db, table))
-    for cand in candidates:
-        if cand in cols:
-            return cand
     return None
 
 
 def _expr_for(db, table, by_table, candidates, joins, alias):
-    """by_table との JOIN 式を組み立て、値の式を返す。
+    """値の式を返す。JOIN が要るスキーマでは JOIN を組み立てる。
 
-    JOIN できない場合はクエリテーブル側のカラムをそのまま値として使う。
-    どちらも無ければ SystemExit（--schema の出力を添えて報告してもらう）。
+    判定の要点: 値カラムそのもの（domain / client）と、ID 参照カラム
+    （domain_id / client_id）を取り違えないこと。FTL v6 の
+    query_storage は domain / client が TEXT の値そのもので、同時に
+    domain_by_id / client_by_id テーブルも存在する。存在だけで JOIN
+    すると TEXT 値を INTEGER の id と突き合わせて全行が落ち、
+    「収集は成功するのに中身が空」という最悪の形で盲目になる。
+    よって JOIN は、FK 宣言があるか、*_id カラムが実在する場合だけ。
     """
     tables = table_names(db)
-    link = _link_column(db, table, by_table, candidates)
+    cols = set(columns(db, table))
+    id_cands = [c for c in candidates if c.endswith("_id")]
+    plain = [c for c in candidates if not c.endswith("_id")]
+    link = _fk_column(db, table, by_table)
+    if link is None:
+        link = next((c for c in id_cands if c in cols), None)
     if by_table in tables and link:
         text = _text_column(db, by_table)
         joins.append("JOIN %s %s ON %s.id = q.%s" % (by_table, alias, alias, link))
         return "%s.%s" % (alias, text)
+    for cand in plain:
+        if cand in cols:
+            return "q.%s" % cand
     if link:
         return "q.%s" % link
     raise SystemExit(
@@ -165,7 +170,7 @@ def client_info(db):
 
 
 def collect(db, start, end):
-    from_sql, domain_expr, client_expr, has_reply, _ = resolve_schema(db)
+    from_sql, domain_expr, client_expr, has_reply, table = resolve_schema(db)
     nx_expr = (
         "SUM(CASE WHEN q.reply_type = %d THEN 1 ELSE 0 END)" % NXDOMAIN_REPLY_TYPE
         if has_reply
@@ -187,14 +192,28 @@ def collect(db, start, end):
     """.format(client=client_expr, nx=nx_expr, frm=from_sql)
     hourly = [list(r) for r in db.execute(hourly_sql, (start, end)).fetchall()]
     out = {"pairs": pairs, "hourly": hourly, "client_info": client_info(db)}
+    warnings = []
     if not has_reply:
         # reply_type が無い DB では NX を数えられない。0 を黙って返すと
         # 「静か」と「測れていない」が区別できなくなるので、警告として
         # 呼び出し側に伝える（NX 系の検知はこのノードでは盲目になる）。
-        out["warnings"] = [
+        warnings.append(
             "no reply_type column: NXDOMAIN counts are 0 on this node; "
             "NX-based detection is blind here"
-        ]
+        )
+    raw = db.execute(
+        "SELECT COUNT(*) FROM %s WHERE timestamp >= ? AND timestamp < ?" % table,
+        (start, end),
+    ).fetchone()[0]
+    if raw > 0 and not pairs:
+        # 生行はあるのに集計が空 = スキーマ解決の取り違え等で盲目に
+        # なっている疑いが濃い。これも黙らない。
+        warnings.append(
+            "aggregation produced 0 pairs from %d raw rows in window; "
+            "schema resolution may be wrong on this node" % raw
+        )
+    if warnings:
+        out["warnings"] = warnings
     return out
 
 
