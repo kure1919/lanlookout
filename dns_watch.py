@@ -4,7 +4,11 @@
 
 運用型:
   - systemd timer から定期実行
-  - 通知に失敗したら state を進めず exit 2（次回リトライ = at-least-once）
+  - 検知の記録と橋渡しイベントは同一トランザクションで確定させ、
+    配信（Talk / activeban）は commit 後に互いに独立して行う
+  - Talk が不達ならメッセージを talk_spool.jsonl に積み、次回実行で
+    先に流す（at-least-once）。不達があった実行は exit 2 で知らせる
+  - 橋渡しが不達ならイベントは bridge_outbox に残り、次回実行で再試行する
   - 重複通知は alerts テーブルの記録で抑止する
 
 検知項目 (v1):
@@ -228,6 +232,11 @@ CREATE TABLE IF NOT EXISTS id_clients (
 CREATE TABLE IF NOT EXISTS id_pairs (
   identity TEXT, domain TEXT, first_seen INTEGER, last_seen INTEGER,
   recent_count INTEGER, PRIMARY KEY (identity, domain)
+);
+CREATE TABLE IF NOT EXISTS bridge_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  queued_at INTEGER, identity TEXT, kind TEXT, event TEXT,
+  attempts INTEGER DEFAULT 0, last_error TEXT
 );
 """
 
@@ -1113,43 +1122,76 @@ def send_activeban(event):
     return json.loads(r.stdout)
 
 
-def bridge_to_activeban(conn, findings, now):
-    """危険シグナルとカナリアを activeban に送る（best-effort）。
+def queue_bridge_events(conn, findings, now):
+    """危険シグナルとカナリアを bridge_outbox に積む（state と同一トランザクション）。
 
-    Talk 通知が本線なので、橋渡しの失敗で検知の記録を巻き戻さない。
-    失敗は標準エラーに残す（activeban 側にもスプールはあるが、届いて
-    いないイベントは向こうでは存在しないため、ここで痕跡を残す）。
+    送信そのものは commit 後の flush_bridge_outbox が担う。検知の記録と
+    「送るべきイベント」を同じトランザクションで確定させることで、
+    Talk 通知の成否や送信の一時失敗でイベントが消えたり、記録だけが
+    進んで二度と送られない、という事故を構造的に無くす。
+    戻り値は積んだ件数。
     """
     cfg = CONFIG["activeban"]
     if not cfg["enabled"]:
-        return
+        return 0
+    queued = 0
     for identity, kind, _akeys, _text in findings:
         if kind not in cfg["report_kinds"]:
             continue
         event = build_activeban_event(conn, identity, kind, now)
         if event is None:
             continue
+        conn.execute(
+            "INSERT INTO bridge_outbox (queued_at, identity, kind, event) "
+            "VALUES (?, ?, ?, ?)",
+            (now, identity, kind, json.dumps(event, ensure_ascii=False)))
+        queued += 1
+    if cfg["canary"]:
+        for identity, domain, count in check_canary(conn, now):
+            event = build_canary_event(conn, identity, domain, count)
+            conn.execute(
+                "INSERT INTO bridge_outbox (queued_at, identity, kind, event) "
+                "VALUES (?, ?, ?, ?)",
+                (now, identity, "CANARY",
+                 json.dumps(event, ensure_ascii=False)))
+            # 再送抑制は「積んだ時点」で記録する。送信リトライは outbox が
+            # 担うので、抑制が先に効いてもイベントは失われない。
+            record_alert(conn, identity, "CANARY", domain, now)
+            queued += 1
+    return queued
+
+
+def flush_bridge_outbox(conn):
+    """bridge_outbox を古い順に送信し、成功した行だけ消す。例外は投げない。
+
+    失敗した行は attempts と last_error を残して次回実行で再試行する。
+    Talk 通知とは完全に独立で、片方の失敗がもう片方を止めない。
+    戻り値は (送信成功数, 残数)。
+    """
+    rows = conn.execute(
+        "SELECT id, identity, kind, event FROM bridge_outbox ORDER BY id"
+    ).fetchall()
+    sent = 0
+    for row_id, identity, kind, event_json in rows:
         try:
-            res = send_activeban(event)
+            res = send_activeban(json.loads(event_json))
             print("activeban report (%s, %s): %s"
                   % (identity, kind, json.dumps(res, ensure_ascii=False)),
                   file=sys.stderr)
+            conn.execute("DELETE FROM bridge_outbox WHERE id = ?", (row_id,))
+            conn.commit()
+            sent += 1
         except Exception as e:
-            print("activeban report failed (%s, %s): %s" % (identity, kind, e),
-                  file=sys.stderr)
-    if cfg["canary"]:
-        for identity, domain, count in check_canary(conn, now):
-            try:
-                res = send_activeban(build_canary_event(
-                    conn, identity, domain, count))
-                print("activeban canary (%s, %s): %s"
-                      % (identity, domain,
-                         json.dumps(res, ensure_ascii=False)),
-                      file=sys.stderr)
-                record_alert(conn, identity, "CANARY", domain, now)
-            except Exception as e:
-                print("activeban canary failed (%s, %s): %s"
-                      % (identity, domain, e), file=sys.stderr)
+            conn.execute(
+                "UPDATE bridge_outbox SET attempts = attempts + 1, "
+                "last_error = ? WHERE id = ?",
+                (str(e)[:200], row_id))
+            conn.commit()
+            print("activeban report failed (%s, %s): %s"
+                  % (identity, kind, e), file=sys.stderr)
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM bridge_outbox").fetchone()[0]
+    return sent, remaining
 
 
 # ---------------------------------------------------------------- 通知
@@ -1199,6 +1241,49 @@ def post_talk(message):
     with urllib.request.urlopen(req, timeout=45) as resp:
         if resp.status >= 300:
             raise RuntimeError("Talk POST failed: HTTP %d" % resp.status)
+
+
+def _talk_spool_path():
+    """未配信の Talk メッセージを溜めるスプール（state DB と同じディレクトリ）。"""
+    return os.path.join(os.path.dirname(CONFIG["state_path"]),
+                        "talk_spool.jsonl")
+
+
+def spool_talk(message, now):
+    """Talk に届かなかったメッセージをスプールへ verbatim で積む。"""
+    path = _talk_spool_path()
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": now, "message": message},
+                           ensure_ascii=False) + "\n")
+
+
+def flush_talk_spool():
+    """スプールを古い順に全て送る。1件でも失敗したら残りを残して例外にする。
+
+    呼び出し側は「スプールが空でなければ Talk は不調」と判断できる。
+    順序を守るため、失敗した時点で打ち切り、未送信分はファイルを
+    書き戻す（ha_monitor の通知スプールと同じ運用型）。
+    """
+    path = _talk_spool_path()
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        lines = [ln for ln in f.read().splitlines() if ln.strip()]
+    sent = 0
+    try:
+        for ln in lines:
+            post_talk(json.loads(ln)["message"])
+            sent += 1
+    finally:
+        rest = lines[sent:]
+        if rest:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(rest) + "\n")
+        elif os.path.exists(path):
+            os.unlink(path)
+    if sent < len(lines):
+        raise RuntimeError("Talk spool flush incomplete: %d/%d"
+                           % (sent, len(lines)))
 
 
 # ---------------------------------------------------------------- main
@@ -1308,32 +1393,51 @@ def run(now, bootstrap=False, dry_run=False):
                 or not _identity_matches_ips(conn, f[0], CONFIG["ignore_clients"])
             ]
 
-        if not findings:
-            # 所見が無くてもカナリアだけは橋渡しする（動作確認プローブ）。
-            # ただし dry-run はプレビューなので、外部への送信は一切しない
-            # （以前はこの分岐だけ dry_run を見ておらず、カナリア経由で
-            # 本物の BAN を飛ばし得た）。
-            if not dry_run:
-                bridge_to_activeban(conn, [], now)
+        if dry_run:
+            # プレビュー専用: 外部送信（Talk / 橋渡し / スプール処理）は
+            # 一切しない。state は進めるが alerts は記録しない（調整用）。
+            # （以前は no-findings 分岐だけ dry_run を見ておらず、カナリア
+            # 経由で本物の BAN を飛ばし得た。ここで一元化して防ぐ。）
+            if findings:
+                print("[dns_watch] DNSベースライン逸脱を検知\n"
+                      + "\n".join(f[3] for f in findings))
             conn.commit()
             return 0
 
-        message = "[dns_watch] DNSベースライン逸脱を検知\n" + "\n".join(
-            f[3] for f in findings
-        )
-        if dry_run:
-            print(message)
-            conn.commit()  # state は進めるが alerts は記録しない（調整用）
-            return 0
-
-        post_talk(message)  # 失敗したら例外 → rollback して exit 2
-        # 危険シグナルだけ activeban へ（best-effort、失敗しても記録は進める）
-        bridge_to_activeban(conn, findings, now)
+        # 検知の記録と橋渡しイベントを同一トランザクションで確定させる。
+        # この commit 以降は、どの配信が失敗しても記録が巻き戻って
+        # 再検知したり、イベントだけが消えたりしない（通知と橋渡しの独立化）。
+        queue_bridge_events(conn, findings, now)
         for client, kind, akeys, _text in findings:
             for akey in akeys:
                 record_alert(conn, client, kind, akey, now)
         conn.commit()
-        return 0
+
+        # commit 後の配信は互いに独立。橋渡しは outbox から送り、失敗分は
+        # 次回実行で再試行する。Talk はスプール（過去の未配信分）を先に
+        # 流し、今回分が届かなければスプールへ積んで exit 2 で知らせる。
+        flush_bridge_outbox(conn)
+        talk_ok = True
+        try:
+            flush_talk_spool()
+        except Exception as e:
+            print("dns_watch: Talk spool flush failed: %s" % e,
+                  file=sys.stderr)
+            talk_ok = False
+        if findings:
+            message = ("[dns_watch] DNSベースライン逸脱を検知\n"
+                       + "\n".join(f[3] for f in findings))
+            if talk_ok:
+                try:
+                    post_talk(message)
+                except Exception as e:
+                    print("dns_watch: Talk POST failed, spooled: %s" % e,
+                          file=sys.stderr)
+                    spool_talk(message, now)
+                    talk_ok = False
+            else:
+                spool_talk(message, now)
+        return 0 if talk_ok else 2
     except Exception:
         conn.rollback()
         raise
@@ -1383,7 +1487,7 @@ def main():
         if args.label is not None:
             return cmd_labels(now, args.label or None)
         return run(now, bootstrap=args.bootstrap, dry_run=args.dry_run)
-    except Exception as e:  # 収集・通知の失敗は state を進めず exit 2
+    except Exception as e:  # 収集の失敗は state を進めず exit 2
         print("dns_watch: %s" % e, file=sys.stderr)
         return 2
 

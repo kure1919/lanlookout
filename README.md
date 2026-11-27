@@ -50,6 +50,16 @@ Notifications go to Nextcloud Talk (or stdout when unconfigured).
 Domains in notifications are defanged (`example[.]com`) so chat
 clients do not auto-fetch the very domains being reported.
 
+Delivery of the two outputs is independent by design. Detection
+results and bridge events are committed to the state database in one
+transaction; Talk posting and bridge sending happen afterwards,
+separately. A Talk outage can no longer suppress a report, and a
+failed report can no longer be silently dropped: undelivered Talk
+messages are queued verbatim in `talk_spool.jsonl` next to the state
+database and flushed first on the next run, and undelivered bridge
+events stay in a `bridge_outbox` table in the state database and are
+retried on every run until the receiver accepts them.
+
 ## How it collects
 
 Nothing is installed on the Pi-hole nodes. Every run, `dns_watch.py`
