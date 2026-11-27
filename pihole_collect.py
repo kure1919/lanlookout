@@ -76,16 +76,28 @@ def _fk_column(db, table, by_table):
     return None
 
 
+def _column_type(db, table, column):
+    """PRAGMA table_info の宣言型（大文字）を返す。無ければ空文字。"""
+    for r in db.execute("PRAGMA table_info(%s)" % table):
+        if r[1] == column:
+            return (r[2] or "").upper()
+    return ""
+
+
 def _expr_for(db, table, by_table, candidates, joins, alias):
     """値の式を返す。JOIN が要るスキーマでは JOIN を組み立てる。
 
-    判定の要点: 値カラムそのもの（domain / client）と、ID 参照カラム
-    （domain_id / client_id）を取り違えないこと。FTL v6 の
-    query_storage は domain / client が TEXT の値そのもので、同時に
-    domain_by_id / client_by_id テーブルも存在する。存在だけで JOIN
-    すると TEXT 値を INTEGER の id と突き合わせて全行が落ち、
-    「収集は成功するのに中身が空」という最悪の形で盲目になる。
-    よって JOIN は、FK 宣言があるか、*_id カラムが実在する場合だけ。
+    判定の要点: 値カラムそのもの（domain / client）と、ID 参照を
+    取り違えないこと。実在する FTL スキーマには両方の形がある:
+      - domain / client が TEXT 型 → 値そのもの（JOIN してはいけない。
+        id と突き合わせると全行が落ち、空の集計になる）
+      - domain_id 等の *_id カラム、または domain / client が INTEGER 型
+        → by_id テーブルへの id 参照（JOIN しなければ id の数字が
+        そのまま「ドメイン」として集計され、中身がゴミになる）
+    FTL v6 の query_storage は後者で、domain / client という名前の
+    INTEGER カラムに id が入る（FK 宣言は無い）。よって判定は
+    「FK 宣言 / *_id カラムの実在 / 値カラムの宣言型が INTEGER」の
+    いずれかで JOIN とする。名前と存在だけでは決めない。
     """
     tables = table_names(db)
     cols = set(columns(db, table))
@@ -94,6 +106,11 @@ def _expr_for(db, table, by_table, candidates, joins, alias):
     link = _fk_column(db, table, by_table)
     if link is None:
         link = next((c for c in id_cands if c in cols), None)
+    if link is None:
+        for cand in plain:
+            if cand in cols and "INT" in _column_type(db, table, cand):
+                link = cand
+                break
     if by_table in tables and link:
         text = _text_column(db, by_table)
         joins.append("JOIN %s %s ON %s.id = q.%s" % (by_table, alias, alias, link))
@@ -211,6 +228,15 @@ def collect(db, start, end):
         warnings.append(
             "aggregation produced 0 pairs from %d raw rows in window; "
             "schema resolution may be wrong on this node" % raw
+        )
+    if pairs and any(not isinstance(r[1], str) or not isinstance(r[0], str)
+                     for r in pairs):
+        # 解決後のドメイン/クライアントが文字列でない = id の数字を
+        # 値として集計している。件数は正常に見えるため、0件警告では
+        # 捕捉できない（2026-11-27 の移行後に実際に踏んだ形）。
+        warnings.append(
+            "aggregated domain/client values are not text; "
+            "schema resolution is treating by_id references as raw values"
         )
     if warnings:
         out["warnings"] = warnings
