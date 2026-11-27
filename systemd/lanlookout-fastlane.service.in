@@ -1,0 +1,10 @@
+[Unit]
+Description=lanlookout fast lane: canary + NX burst (fastlane.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=/usr/bin/python3 __INSTALL_DIR__/fastlane.py

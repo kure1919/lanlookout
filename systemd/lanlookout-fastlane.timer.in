@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the lanlookout fast lane every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Unit=lanlookout-fastlane.service
+
+[Install]
+WantedBy=timers.target

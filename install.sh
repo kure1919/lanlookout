@@ -48,23 +48,24 @@ echo "  state:  $STATE_DIR ready"
 # 3. systemd units
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
-for u in lanlookout.service lanlookout.timer; do
+UNITS="lanlookout.service lanlookout.timer lanlookout-fastlane.service lanlookout-fastlane.timer"
+for u in $UNITS; do
   sed -e "s|__USER__|$RUN_USER|g" -e "s|__INSTALL_DIR__|$SRC|g" \
     "$SRC/systemd/$u.in" > "$TMPD/$u"
 done
 
 install_units() {
-  cp "$TMPD/lanlookout.service" "$TMPD/lanlookout.timer" "$UNIT_DIR/"
+  for u in $UNITS; do cp "$TMPD/$u" "$UNIT_DIR/"; done
 }
 if [ -w "$UNIT_DIR" ]; then
   install_units
 elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-  sudo cp "$TMPD/lanlookout.service" "$TMPD/lanlookout.timer" "$UNIT_DIR/"
+  for u in $UNITS; do sudo cp "$TMPD/$u" "$UNIT_DIR/"; done
 else
   echo "  units:  cannot write $UNIT_DIR (no writable dir, no passwordless sudo)."
   echo "          Generated units are shown below; install them manually:"
   echo "            sudo cp <generated> $UNIT_DIR/ && sudo systemctl daemon-reload && sudo systemctl enable --now lanlookout.timer"
-  for u in lanlookout.service lanlookout.timer; do
+  for u in $UNITS; do
     echo "--- $u"; cat "$TMPD/$u"
   done
   echo "  done (config and state are in place; units are not)"
@@ -80,6 +81,11 @@ if command -v systemctl >/dev/null 2>&1; then
     echo "  timer:  lanlookout.timer enabled (every 30 min, :07/:37)"
   else
     echo "  timer:  units installed; enable manually: $SCTL enable --now lanlookout.timer"
+  fi
+  if $SCTL enable --now lanlookout-fastlane.timer >/dev/null 2>&1; then
+    echo "  timer:  lanlookout-fastlane.timer enabled (every 5 min)"
+  else
+    echo "  timer:  fast lane installed; enable manually: $SCTL enable --now lanlookout-fastlane.timer"
   fi
 fi
 

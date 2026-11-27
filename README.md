@@ -60,6 +60,19 @@ database and flushed first on the next run, and undelivered bridge
 events stay in a `bridge_outbox` table in the state database and are
 retried on every run until the receiver accepts them.
 
+## Fast lane
+
+The main run is a 30-minute batch, so a tripwire signal can wait up to
+30 minutes to be reported. `fastlane.py` is a companion on a 5-minute
+timer that looks only at the last 15 minutes and checks only two
+things: queries for the activeban canary domain, and NXDOMAIN bursts
+(>= 20 NX and >= 50% of a device's queries in the window). It reuses
+the same collector and bridge, keeps no baseline state (suppression
+timestamps live in `fastlane_state.json` next to the state database),
+and reports directly; activeban itself announces the resulting bans
+and releases. The main lane remains the system of record — the fast
+lane only shortens the tripwire's detection latency.
+
 ## How it collects
 
 Nothing is installed on the Pi-hole nodes. Every run, `dns_watch.py`
