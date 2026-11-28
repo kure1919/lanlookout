@@ -29,6 +29,10 @@
   "name": "urlhaus+openphish",
   "path": "~/.config/lanlookout/intel_domains.txt"
  },
+ "kuma": {
+  "_comment": "Optional Uptime Kuma push heartbeat. After each successful main-lane run, a GET is sent to push_url (the Push monitor URL from Kuma, without query parameters). If pushes stop, Kuma raises the 'monitor is dead' alert. Empty/absent disables. The fast lane never pushes - it must not mask a main-lane death.",
+  "push_url": ""
+ },
  "new_pair_burst_threshold": 30,
  "new_pair_max_client_pairs": 400,
  "new_pair_window_days": 90,

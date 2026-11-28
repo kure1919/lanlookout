@@ -1815,12 +1815,34 @@ def run(now, bootstrap=False, dry_run=False):
                     talk_ok = False
             else:
                 spool_talk(message, now)
+        push_kuma_heartbeat()
         return 0 if talk_ok else 2
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+
+def push_kuma_heartbeat():
+    """Uptime Kuma のプッシュモニタへ生存通知を送る（任意設定）。
+
+    送るのは本レーンが正常完了したときだけ。高速レーンからは送らない
+    （本レーンの死を高速レーンの生存で隠してしまうため）。プッシュが
+    途絶えたら Kuma 側が「監視が死んだ」と判断する — 2026-11 の
+    3.5日間の無言死への対策。失敗しても実行結果には影響させない
+    （監視の監視が本隊を道連れにしない）。
+    """
+    url = (CONFIG.get("kuma") or {}).get("push_url")
+    if not url:
+        return
+    sep = "&" if "?" in url else "?"
+    full = url + sep + "status=up&msg=OK&ping="
+    try:
+        with urllib.request.urlopen(full, timeout=5) as resp:
+            resp.read()
+    except Exception as e:
+        print("dns_watch: Kuma push failed: %s" % e, file=sys.stderr)
 
 
 def cmd_labels(now, only_ip=None):
