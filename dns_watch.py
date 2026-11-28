@@ -18,6 +18,8 @@
   NIGHT      0–5 時の通信量がその端末の平常夜間から跳ねた
   INTEL      直近24hの宛先が脅威インテルリストに一致（任意・intel 設定）
   NEW_PAIR_BURST 24h の新規宛先の件数そのものが跳ねた（無差別な探索の型）
+  TREND      10日バケットで見た通信量・新規宛先数が増え続ける（徐汚染の型。
+             機器らしい端末のみ・通知のみ）
 
 データ取得: ssh で各ノードに pihole_collect.py を流し込み、FTL DB を
 読み取りで集計した結果 (JSON) だけを受け取る。ノード側への常駐物はない。
@@ -91,6 +93,19 @@ NIGHT_MIN_COUNT = 100        # 夜間急増とみなす 0–5 時の最低件数
 NIGHT_FACTOR = 1.5           # 過去夜間の最大値の何倍で「前例のない夜」とするか
 NIGHT_MIN_NIGHTS = 5         # 判定に必要な過去夜間のサンプル数
 ALERT_SUPPRESS_DAYS = 7      # 同一所見の再通知を抑える日数
+# TREND（緩やかな増加）: 短窓比較では平常に取り込まれる坂を見る。
+# 対象は NEW_PAIR と同じ「機器らしい端末」だけ（人の端末の増加は正常）。
+# 通知のみで、activeban への報告対象にはしない。
+TREND_BUCKET_DAYS = 10       # 傾きを見るバケット幅
+TREND_MIN_AGE_DAYS = 40      # これより若い端末は判定しない（新規は除外）
+TREND_VOL_BUCKETS = 3        # 通信量: 直近 30 日を 3 バケットで見る
+TREND_VOL_STEP = 1.25        # バケット毎に最低この倍率で増えていること
+TREND_VOL_TOTAL = 2.0        # 最初→最後で最低この倍率
+TREND_VOL_MIN = 50           # 最終バケットの日次中央値の絶対下限/日
+TREND_DST_BUCKETS = 4        # 宛先種類: 直近 40 日を 4 バケットで見る
+TREND_DST_MIN_LAST = 10      # 最終バケットの新規宛先数の下限
+TREND_DST_TOTAL = 3.0        # 最初→最後で最低この倍率
+TREND_SUPPRESS_DAYS = 30     # 同一所見の再通知を抑える日数
 SELF_IPS = {"127.0.0.1", "::1"}  # リゾルバ自身は検知対象にしない
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1141,6 +1156,99 @@ def check_new_pair_burst(conn, now, skip_identities=frozenset()):
     return findings
 
 
+def _median(values):
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def check_trend(conn, now):
+    """緩やかな増加（徐汚染）の検知。通知のみ（報告対象にしない）。
+
+    短窓 vs 直近平常の比較は、2 週間以上かけた坂を平常側に取り込む。
+    ここでは 10 日バケットの傾きそのものを見る。対象は NEW_PAIR と
+    同じ適格（直近ウィンドウの宛先種類が上限以下＝機器らしい端末）
+    かつ、既知になってから TREND_MIN_AGE_DAYS 以上経った端末だけ。
+    人の端末は利用の増加が正常なので構造的に入ってこないし、
+    新規端末は「ゼロから増えている」ようにしか見えないので年齢で
+    除外する。IoT の正常な変化は階段型（水準が変わって平ら）で、
+    坂が続くこと自体が異常の形、という前提の検知。
+    """
+    findings = []
+    window = CONFIG["new_pair_window_days"] * DAY
+    cap = CONFIG["new_pair_max_client_pairs"]
+    eligible = {r[0] for r in conn.execute(
+        "SELECT identity FROM id_pairs WHERE last_seen >= ? "
+        "GROUP BY identity HAVING COUNT(*) <= ?",
+        (now - window, cap)).fetchall()}
+    first_seen = dict(conn.execute(
+        "SELECT identity, first_seen FROM id_clients").fetchall())
+    ignores = CONFIG["ignore_new_pair"]
+    series = _id_hourly_series(conn)
+    today = datetime.fromtimestamp(now, JST).date()
+
+    def day_total(per, day):
+        start = int(datetime(day.year, day.month, day.day,
+                             tzinfo=JST).timestamp())
+        return _series_sums(per, start, start + DAY)[0]
+
+    for ident in sorted(eligible):
+        fs = first_seen.get(ident)
+        if fs is None or fs > now - TREND_MIN_AGE_DAYS * DAY:
+            continue
+        if ignores and _identity_matches_ips(conn, ident, ignores):
+            continue
+        per = series.get(ident, {})
+
+        # 通信量: 10 日 × 3 バケットの日次中央値の傾き
+        medians = []
+        for b in range(TREND_VOL_BUCKETS):
+            newest = today - timedelta(days=b * TREND_BUCKET_DAYS)
+            days = [newest - timedelta(days=i)
+                    for i in range(TREND_BUCKET_DAYS)]
+            medians.append(_median([day_total(per, d) for d in days]))
+        medians.reverse()  # 古い順
+        if (medians[0] > 0
+                and all(medians[i + 1] >= TREND_VOL_STEP * medians[i]
+                        for i in range(len(medians) - 1))
+                and medians[-1] >= TREND_VOL_TOTAL * medians[0]
+                and medians[-1] >= TREND_VOL_MIN
+                and not already_alerted(conn, ident, "TREND", "volume",
+                                        now, days=TREND_SUPPRESS_DAYS)):
+            findings.append(
+                (ident, "TREND", ["volume"],
+                 "■ 緩やかな増加 %s: 通信量の10日中央値が %s と増加継続"
+                 "（徐汚染の型）"
+                 % (identity_label(conn, ident),
+                    " → ".join("%g" % m for m in medians))))
+
+        # 宛先種類: 10 日 × 4 バケットの新規宛先数の傾き
+        counts = []
+        for b in range(TREND_DST_BUCKETS):
+            end = now - b * TREND_BUCKET_DAYS * DAY
+            start = end - TREND_BUCKET_DAYS * DAY
+            counts.append(conn.execute(
+                "SELECT COUNT(*) FROM id_pairs WHERE identity = ? "
+                "AND first_seen >= ? AND first_seen < ?",
+                (ident, start, end)).fetchone()[0])
+        counts.reverse()  # 古い順
+        if (all(counts[i + 1] > counts[i]
+                for i in range(len(counts) - 1))
+                and counts[-1] >= TREND_DST_MIN_LAST
+                and counts[-1] >= TREND_DST_TOTAL * max(counts[0], 1)
+                and not already_alerted(conn, ident, "TREND",
+                                        "destinations", now,
+                                        days=TREND_SUPPRESS_DAYS)):
+            findings.append(
+                (ident, "TREND", ["destinations"],
+                 "■ 緩やかな増加 %s: 新規宛先数が10日毎に %s と増加継続"
+                 % (identity_label(conn, ident),
+                    " → ".join(str(c) for c in counts))))
+    return findings
+
+
 CANARY_DOMAIN = "canary.activeban.invalid"
 
 
@@ -1585,6 +1693,7 @@ def run(now, bootstrap=False, dry_run=False):
         findings += check_new_pair_burst(
             conn, now,
             skip_identities=new_ids | known_released_identities(conn, now))
+        findings += check_trend(conn, now)
         # リゾルバ自身 (127.0.0.1 等) は「クライアント」ではない。FTL が
         # 端末のホスト名を引く PTR 問い合わせ等がここに出るため丸ごと外す。
         findings = [f for f in findings if f[0] not in SELF_IPS]

@@ -38,6 +38,7 @@ IP does not inherit another device's history):
 | `NIGHT` | 00:00–05:00 traffic far above the device's previous busiest night | No (configurable) |
 | `NEW_PAIR_BURST` | A machine-like device touched an abnormal *number* of new destinations in 24 h (one-shot-each spray that per-pair detection misses) | **Yes** (configurable) |
 | `INTEL` | A destination touched in the last 24 h matches a threat-intel domain list (optional; use high-precision malware/C2/phishing feeds only) | **Yes** (configurable) |
+| `TREND` | Query volume or new-destination count keeps rising across 10-day buckets (slow-drift poisoning that short-window comparisons absorb into the baseline). Machine-like devices only, known for 40+ days | No — notify only |
 | canary | A query for `*.canary.activeban.invalid` | **Yes** (test probe) |
 
 The `INTEL` check deliberately ignores `first_seen`: a C2 domain that
