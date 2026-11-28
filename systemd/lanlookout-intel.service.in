@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the lanlookout threat-intel domain list (intel_fetch.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=/usr/bin/python3 __INSTALL_DIR__/intel_fetch.py

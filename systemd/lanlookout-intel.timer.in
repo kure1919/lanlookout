@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the lanlookout intel list daily
+
+[Timer]
+OnCalendar=*-*-* 05:17
+Persistent=true
+Unit=lanlookout-intel.service
+
+[Install]
+WantedBy=timers.target

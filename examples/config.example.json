@@ -16,21 +16,28 @@
  "arp_sweep": true,
  "device_names_path": "~/.config/lanlookout/device_names.json",
  "ftl_db": "/srv/pi-hole/etc-pihole/pihole-FTL.db",
+ "hourly_retention_days": 40,
  "ignore_clients": [],
  "ignore_domain_patterns": [
   "*.prod.do.dsp.mp.microsoft.com",
   "*.googlevideo.com"
  ],
  "ignore_new_pair": [],
+ "intel": {
+  "_comment": "Optional threat-intel matching (INTEL findings). Use high-precision malware/C2/phishing domain feeds only - a hit is reported to activeban as trigger 'intel' when INTEL is in report_kinds. The list file (one domain per line) is refreshed daily by intel_fetch.py from intel_sources.",
+  "enabled": false,
+  "name": "urlhaus+openphish",
+  "path": "~/.config/lanlookout/intel_domains.txt"
+ },
+ "new_pair_burst_threshold": 30,
  "new_pair_max_client_pairs": 400,
+ "new_pair_window_days": 90,
  "nodes": [
   "pihole1",
   "pihole2"
  ],
+ "retention_days": 180,
  "ssh_user": "ansible",
  "state_path": "~/.local/state/dns-watch/state.db",
- "use_sudo": false,
- "new_pair_window_days": 90,
- "retention_days": 180,
- "hourly_retention_days": 40
+ "use_sudo": false
 }

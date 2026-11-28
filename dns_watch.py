@@ -11,11 +11,13 @@
   - 橋渡しが不達ならイベントは bridge_outbox に残り、次回実行で再試行する
   - 重複通知は alerts テーブルの記録で抑止する
 
-検知項目 (v1):
+検知項目:
   NEW_PAIR   端末が初めて引いたドメイン（24h 以内に first_seen、24h で 2 回以上）
   NEW_CLIENT ベースラインに無かった端末の出現
   NX_SPIKE   端末の NXDOMAIN 率・件数が平常時から跳ねた（DGA / 設定ミス兆候）
   NIGHT      0–5 時の通信量がその端末の平常夜間から跳ねた
+  INTEL      直近24hの宛先が脅威インテルリストに一致（任意・intel 設定）
+  NEW_PAIR_BURST 24h の新規宛先の件数そのものが跳ねた（無差別な探索の型）
 
 データ取得: ssh で各ノードに pihole_collect.py を流し込み、FTL DB を
 読み取りで集計した結果 (JSON) だけを受け取る。ノード側への常駐物はない。
@@ -40,6 +42,11 @@
                         （既定 ["NX_SPIKE"]）/ ttl_seconds / canary。
                         dns_watch は読み取り専用のまま、危険シグナルと
                         カナリアだけを SSH 越しに report する。
+       intel            脅威インテル突き合わせ（任意・既定は無効）。
+                        enabled / path（1行1ドメインのリスト）/ name。
+                        リストの取得・更新は intel_fetch.py が担う。
+       new_pair_burst_threshold
+                        NEW_PAIR_BURST とみなす 24h 新規宛先数。既定 30。
   2. Nextcloud 共通: ~/.config/lanlookout/nextcloud.json
      nextcloud_url / talk_token / username / app_password のみを持つ。
      他の監視ツールと共有できる
@@ -127,6 +134,29 @@ def _load_config():
         "ignore_domain_patterns": [
             str(x).lower() for x in cfg.get("ignore_domain_patterns", [])
         ],
+        # 脅威インテル突き合わせ（INTEL 検知）。リストは1行1ドメインの
+        # テキストで、intel_fetch.py が別途更新する。広告系リストでは
+        # なくマルウェア/C2・フィッシング専用の高精度フィードを使う
+        # こと（触っただけでバンに繋がるため）。
+        "intel": {
+            "enabled": bool((cfg.get("intel") or {}).get("enabled", False)),
+            "path": os.path.expanduser(
+                (cfg.get("intel") or {}).get(
+                    "path", "~/.config/lanlookout/intel_domains.txt")),
+            "name": str((cfg.get("intel") or {}).get("name", "intel feed")),
+        },
+        # 新規宛先バースト（NEW_PAIR_BURST）とみなす 24h 新規宛先数。
+        "new_pair_burst_threshold": int(
+            cfg.get("new_pair_burst_threshold", 30)),
+        # インテルリストの取得元（intel_fetch.py が使う）。既定は
+        # キー不要で引けるマルウェア/フィッシング系フィード2件。
+        # abuse.ch 本家は 2026-10 から Auth-Key 必須になったため、
+        # URLhaus 由来はこちら（domains 抽出済みのミラー）を使う。
+        "intel_sources": list(cfg.get("intel_sources", [
+            "https://malware-filter.gitlab.io/malware-filter/"
+            "urlhaus-filter-domains-online.txt",
+            "https://openphish.com/feed.txt",
+        ])),
         # 行動系の検知（NEW_PAIR / NX_SPIKE / NIGHT）を丸ごと外す端末。
         # NEW_CLIENT には効かせない（除外した IP を別端末が拾ったら知りたい）。
         "ignore_clients": set(cfg.get("ignore_clients", [])),
@@ -984,6 +1014,133 @@ def check_night(conn, now):
 # ここでは「定量的な根拠（recent）と普段の様子（baseline）」を同梱する。
 # NEW_PAIR / NEW_CLIENT は発見シグナルなので対象にしない。
 
+# ---------------------------------------------------------------- インテル
+
+_INTEL_CACHE = {"path": None, "mtime": None, "domains": frozenset()}
+
+
+def load_intel_domains():
+    """インテルリスト（1行1ドメイン、# 始まりはコメント）を読む。
+
+    読めない・無い場合は空集合（= INTEL 検知は黙って無効。リストの
+    取得失敗で検知全体を落とさない）。mtime が変わった時だけ読み直す。
+    """
+    path = CONFIG["intel"]["path"]
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return frozenset()
+    if _INTEL_CACHE["path"] == path and _INTEL_CACHE["mtime"] == mtime:
+        return _INTEL_CACHE["domains"]
+    domains = set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                d = line.strip().lower().rstrip(".")
+                if d and not d.startswith("#"):
+                    domains.add(d)
+    except OSError:
+        return frozenset()
+    _INTEL_CACHE.update(path=path, mtime=mtime, domains=frozenset(domains))
+    return _INTEL_CACHE["domains"]
+
+
+def intel_match(domain, listed):
+    """domain がリスト記載ドメイン自身かそのサブドメインなら記載側を返す。
+
+    巻き上げるのは「記載ドメインの配下」方向だけ。記載されたサブ
+    ドメインから親や兄弟へは広げない（共有ホスティング等の巻き添え
+    回避）。
+    """
+    d = domain.lower().rstrip(".")
+    while d:
+        if d in listed:
+            return d
+        if "." not in d:
+            return None
+        d = d.split(".", 1)[1]
+    return None
+
+
+def check_intel(conn, now):
+    """脅威インテル一致: 直近24hに触った宛先を静的リストと突き合わせる。
+
+    first_seen を問わないのが要点。ベースラインに毒が入って「普段の
+    宛先」化した C2 はベースライン系の検知では原理的に拾えないが、
+    静的リストなら拾える。再通知は (同一性, ドメイン) で1日抑制。
+    """
+    findings = []
+    if not CONFIG["intel"]["enabled"]:
+        return findings
+    listed = load_intel_domains()
+    if not listed:
+        return findings
+    rows = conn.execute(
+        "SELECT identity, domain, recent_count FROM id_pairs "
+        "WHERE last_seen >= ? ORDER BY identity, recent_count DESC",
+        (now - DAY,)).fetchall()
+    by_id = {}
+    for ident, domain, count in rows:
+        entry = intel_match(domain, listed)
+        if entry:
+            by_id.setdefault(ident, []).append((domain, count))
+    for ident, items in sorted(by_id.items()):
+        fresh = [(d, c) for d, c in items
+                 if not already_alerted(conn, ident, "INTEL", d, now, days=1)]
+        if not fresh:
+            continue
+        shown = fresh[:NEW_PAIR_MAX_PER_CLIENT]
+        text = "、".join("%s (%d回)" % (_defang(d), c) for d, c in shown)
+        if len(fresh) > len(shown):
+            text += " ほか%d件" % (len(fresh) - len(shown))
+        findings.append((ident, "INTEL", [d for d, _ in fresh],
+                         "■ 脅威インテル一致 %s: %s [%s]"
+                         % (identity_label(conn, ident), text,
+                            CONFIG["intel"]["name"])))
+    return findings
+
+
+def check_new_pair_burst(conn, now, skip_identities=frozenset()):
+    """新規宛先バースト: 24hの新規宛先の「数」そのものを見る。
+
+    NEW_PAIR は宛先ごとに2回以上を要求するため、多数の新規宛先へ
+    1回ずつという無差別な型（探索・列挙）ですり抜ける。ここでは
+    NEW_PAIR と同じ「機器らしい」適格条件の端末に限って件数で拾う。
+    人間の端末は日常的に100件超の新規宛先を踏むので対象にしない。
+    """
+    findings = []
+    rows = conn.execute(
+        """
+        SELECT identity, COUNT(*) AS n FROM id_pairs
+        WHERE first_seen >= ? AND domain LIKE '%.%'
+          AND (SELECT COUNT(*) FROM id_pairs q
+               WHERE q.identity = id_pairs.identity AND q.last_seen >= ?) <= ?
+        GROUP BY identity HAVING n >= ?
+        ORDER BY n DESC
+        """,
+        (now - DAY, now - CONFIG["new_pair_window_days"] * DAY,
+         CONFIG["new_pair_max_client_pairs"],
+         CONFIG["new_pair_burst_threshold"]),
+    ).fetchall()
+    for ident, n in rows:
+        if ident in skip_identities:
+            continue
+        if _identity_matches_ips(conn, ident, CONFIG["ignore_new_pair"]):
+            continue
+        akey = datetime.fromtimestamp(now, JST).strftime("%Y-%m-%d")
+        if already_alerted(conn, ident, "NEW_PAIR_BURST", akey, now, days=1):
+            continue
+        top = [r[0] for r in conn.execute(
+            "SELECT domain FROM id_pairs WHERE identity = ? "
+            "AND first_seen >= ? ORDER BY recent_count DESC LIMIT 5",
+            (ident, now - DAY)).fetchall()]
+        findings.append((ident, "NEW_PAIR_BURST", [akey],
+                         "■ 新規宛先バースト %s: 24hで新規 %d件（%s）"
+                         % (identity_label(conn, ident), n,
+                            "、".join(_defang(d) for d in top))))
+    return findings
+
+
 CANARY_DOMAIN = "canary.activeban.invalid"
 
 
@@ -1067,6 +1224,47 @@ def build_activeban_event(conn, identity, kind, now):
         return {"device": device, "trigger": "behavior", "reason": reason,
                 "ttl": CONFIG["activeban"]["ttl_seconds"],
                 "evidence": {"recent": recent, "baseline": baseline}}
+    if kind == "INTEL":
+        listed = load_intel_domains()
+        hits = []
+        for domain, count in conn.execute(
+                "SELECT domain, recent_count FROM id_pairs "
+                "WHERE identity = ? AND last_seen >= ? "
+                "ORDER BY recent_count DESC", (identity, now - DAY)):
+            entry = intel_match(domain, listed)
+            if entry:
+                hits.append({"domain": domain, "listed_entry": entry,
+                             "count": count})
+        if not hits:
+            return None
+        return {"device": device, "trigger": "intel",
+                "reason": ("threat intel match: %s listed in %s"
+                           % (hits[0]["domain"], CONFIG["intel"]["name"])),
+                "ttl": CONFIG["activeban"]["ttl_seconds"],
+                "evidence": {
+                    "intel": {"list": CONFIG["intel"]["name"],
+                              "hits": hits[:10]},
+                    "recent": {"window_seconds": DAY,
+                               "counts": {"queries": sum(
+                                   h["count"] for h in hits)}},
+                    "baseline": baseline}}
+    if kind == "NEW_PAIR_BURST":
+        n = conn.execute(
+            "SELECT COUNT(*) FROM id_pairs WHERE identity = ? "
+            "AND first_seen >= ? AND domain LIKE '%.%'",
+            (identity, now - DAY)).fetchone()[0]
+        top = [r[0] for r in conn.execute(
+            "SELECT domain FROM id_pairs WHERE identity = ? "
+            "AND first_seen >= ? ORDER BY recent_count DESC LIMIT 10",
+            (identity, now - DAY)).fetchall()]
+        return {"device": device, "trigger": "behavior",
+                "reason": ("new-destination burst: %d new domains in 24h"
+                           % n),
+                "ttl": CONFIG["activeban"]["ttl_seconds"],
+                "evidence": {
+                    "recent": {"window_seconds": DAY, "new_pair_count": n,
+                               "top_new_domains": top},
+                    "baseline": baseline}}
     return None
 
 
@@ -1383,6 +1581,10 @@ def run(now, bootstrap=False, dry_run=False):
         )
         findings += check_nx_spike(conn, now)
         findings += check_night(conn, now)
+        findings += check_intel(conn, now)
+        findings += check_new_pair_burst(
+            conn, now,
+            skip_identities=new_ids | known_released_identities(conn, now))
         # リゾルバ自身 (127.0.0.1 等) は「クライアント」ではない。FTL が
         # 端末のホスト名を引く PTR 問い合わせ等がここに出るため丸ごと外す。
         findings = [f for f in findings if f[0] not in SELF_IPS]

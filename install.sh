@@ -48,7 +48,7 @@ echo "  state:  $STATE_DIR ready"
 # 3. systemd units
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
-UNITS="lanlookout.service lanlookout.timer lanlookout-fastlane.service lanlookout-fastlane.timer"
+UNITS="lanlookout.service lanlookout.timer lanlookout-fastlane.service lanlookout-fastlane.timer lanlookout-intel.service lanlookout-intel.timer"
 for u in $UNITS; do
   sed -e "s|__USER__|$RUN_USER|g" -e "s|__INSTALL_DIR__|$SRC|g" \
     "$SRC/systemd/$u.in" > "$TMPD/$u"
@@ -86,6 +86,11 @@ if command -v systemctl >/dev/null 2>&1; then
     echo "  timer:  lanlookout-fastlane.timer enabled (every 5 min)"
   else
     echo "  timer:  fast lane installed; enable manually: $SCTL enable --now lanlookout-fastlane.timer"
+  fi
+  if $SCTL enable --now lanlookout-intel.timer >/dev/null 2>&1; then
+    echo "  timer:  lanlookout-intel.timer enabled (daily intel refresh)"
+  else
+    echo "  timer:  intel refresh installed; enable manually: $SCTL enable --now lanlookout-intel.timer"
   fi
 fi
 

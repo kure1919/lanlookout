@@ -36,7 +36,16 @@ IP does not inherit another device's history):
 | `NEW_PAIR` | A machine-like device (small destination set) queried a domain it never queried before | No — discovery |
 | `NX_SPIKE` | NXDOMAIN count/ratio jumped far above the device's own baseline (DGA / misconfiguration signature) | **Yes** |
 | `NIGHT` | 00:00–05:00 traffic far above the device's previous busiest night | No (configurable) |
+| `NEW_PAIR_BURST` | A machine-like device touched an abnormal *number* of new destinations in 24 h (one-shot-each spray that per-pair detection misses) | **Yes** (configurable) |
+| `INTEL` | A destination touched in the last 24 h matches a threat-intel domain list (optional; use high-precision malware/C2/phishing feeds only) | **Yes** (configurable) |
 | canary | A query for `*.canary.activeban.invalid` | **Yes** (test probe) |
+
+The `INTEL` check deliberately ignores `first_seen`: a C2 domain that
+has been in a device's baseline for months is invisible to every
+baseline-based signal, but a static list still catches it.
+`intel_fetch.py` refreshes the list daily from `intel_sources` with
+sanity gates (a failed or implausible feed never replaces the
+existing list).
 
 Discovery signals are deliberately **not** ban triggers. New is not
 dangerous; *quantitatively abnormal* is. When the optional activeban
