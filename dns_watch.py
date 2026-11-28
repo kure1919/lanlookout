@@ -89,6 +89,9 @@ NEW_PAIR_MAX_PER_CLIENT = 8  # 通知に列挙するドメイン数の上限/端
 NX_MIN_COUNT = 50            # NXDOMAIN 急増とみなす 24h 最低件数
 NX_MIN_RATIO = 0.35          # NXDOMAIN 急増とみなす 24h 最低率
 NX_BASELINE_FACTOR = 3.0     # 平常率の何倍で急増とするか
+NX_DELTA_MIN = 0.30          # 率の差分（pt）でも発火させる下限。
+                             # 平常率が高い端末では 3 倍条件が率 100% を
+                             # 超えて永遠に発火しないため、差分を併用する
 NIGHT_MIN_COUNT = 100        # 夜間急増とみなす 0–5 時の最低件数
 NIGHT_FACTOR = 1.5           # 過去夜間の最大値の何倍で「前例のない夜」とするか
 NIGHT_MIN_NIGHTS = 5         # 判定に必要な過去夜間のサンプル数
@@ -978,8 +981,14 @@ def check_nx_spike(conn, now):
             continue
         c0, n0 = _series_sums(per, now - 14 * DAY, now - DAY)
         ratio0 = (n0 / c0) if c0 else 0.0
-        if n0 >= 10 and ratio1 < NX_BASELINE_FACTOR * ratio0:
-            continue
+        if n0 >= 10:
+            # 倍率か差分のどちらかで発火。倍率だけだと平常率が約 1/3
+            # 以上の端末（死んだベンダークラウドを叩き続ける等）は
+            # 3 倍が 100% を超えて永遠に発火しない。
+            factor_hit = ratio1 >= NX_BASELINE_FACTOR * ratio0
+            delta_hit = (ratio1 - ratio0) >= NX_DELTA_MIN
+            if not (factor_hit or delta_hit):
+                continue
         akey = datetime.fromtimestamp(now, JST).strftime("%Y-%m-%d")
         if already_alerted(conn, ident, "NX_SPIKE", akey, now, days=1):
             continue
