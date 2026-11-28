@@ -9,7 +9,9 @@ at the last WINDOW seconds and checks only those two signals:
 
   - canary: any query for canary.activeban.invalid or a subdomain
   - NX burst: >= NX_BURST_MIN NXDOMAIN replies and >= NX_BURST_RATIO of
-    all queries from one device inside the window
+    all queries from one device inside the window; the report evidence
+    carries the top NX domains and the distinct NX domain count, so
+    the verifier can tell OS resolver noise from DGA-shaped labels
 
 It keeps no baseline state. Suppression timestamps live in a small JSON
 file next to the main state DB (fastlane_state.json); an event is only
@@ -141,12 +143,20 @@ def find_canary(pairs, info, ip_mac, suppressed, now):
 
 
 def find_nx_burst(pairs, info, ip_mac, suppressed, now):
-    """端末単位で窓内の (合計, NX) を集め、バーストを返す。"""
+    """端末単位で窓内の (合計, NX) を集め、バーストを返す。
+
+    戻り値には NX のドメイン内訳（上位と相異数）も含める。件数と率
+    だけでは、判定側が「OS の名前解決ノイズ（サフィックス探索や
+    WPAD 等）」と「DGA 型のランダムラベル」を区別できないため。
+    """
     per = {}
+    nx_domains = {}
     for (ip, domain), (count, nx, _f, _l) in pairs.items():
         a = per.setdefault(ip, [0, 0])
         a[0] += count
         a[1] += nx
+        if nx > 0:
+            nx_domains.setdefault(ip, []).append((domain, nx))
     out = []
     for ip, (total, nx) in per.items():
         if _is_self_ip(ip):
@@ -161,7 +171,8 @@ def find_nx_burst(pairs, info, ip_mac, suppressed, now):
         if _suppressed(suppressed, "nx|%s" % mac, now, NX_SUPPRESS):
             continue
         name = (info.get(ip) or {}).get("name", "")
-        out.append((mac, ip, name, total, nx))
+        doms = sorted(nx_domains.get(ip, []), key=lambda t: -t[1])
+        out.append((mac, ip, name, total, nx, doms[:10], len(doms)))
     return out
 
 
@@ -179,7 +190,7 @@ def canary_event(mac, ip, name, domain, count):
                                     "counts": {"queries": count}}}}
 
 
-def nx_event(mac, ip, name, total, nx):
+def nx_event(mac, ip, name, total, nx, top_nx=(), nx_distinct=0):
     ratio = round(nx / total, 4) if total else 0.0
     return {"device": {"mac": mac, "ip": ip, "name": name},
             "trigger": "behavior",
@@ -189,7 +200,11 @@ def nx_event(mac, ip, name, total, nx):
             "ttl": dw.CONFIG["activeban"]["ttl_seconds"],
             "evidence": {"recent": {"window_seconds": WINDOW,
                                     "counts": {"queries": total, "nx": nx},
-                                    "nx_ratio": ratio},
+                                    "nx_ratio": ratio,
+                                    "top_nx_domains": [
+                                        {"domain": d, "nx": c}
+                                        for d, c in top_nx],
+                                    "nx_distinct_domains": nx_distinct},
                          "baseline": None,
                          "baseline_note": "fast lane: short window, "
                                           "no baseline attached"}}
@@ -213,9 +228,11 @@ def run(now, dry_run=False):
             jobs.append(("canary|%s|%s" % (mac, domain),
                          canary_event(mac, ip, name, domain, count)))
     if "NX_SPIKE" in cfg["report_kinds"]:
-        for mac, ip, name, total, nx in find_nx_burst(
+        for mac, ip, name, total, nx, top_nx, nx_distinct in find_nx_burst(
                 pairs, info, ip_mac, suppressed, now):
-            jobs.append(("nx|%s" % mac, nx_event(mac, ip, name, total, nx)))
+            jobs.append(("nx|%s" % mac,
+                         nx_event(mac, ip, name, total, nx,
+                                  top_nx, nx_distinct)))
     for key, event in jobs:
         if dry_run:
             print("fastlane dry-run: %s"

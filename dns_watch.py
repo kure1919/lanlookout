@@ -114,6 +114,13 @@ TREND_SUPPRESS_DAYS = 30     # 同一所見の再通知を抑える日数
 # 検知対象から卒業してしまう（自己除外）。そこで first_seen が
 # ESTABLISHED_DAYS より古い＝確立済みの宛先だけを数える。
 ESTABLISHED_DAYS = 7
+# NEW_PAIR_BURST を activeban へ橋渡しする身元の最低年齢。確立済み
+# 宛先は ESTABLISHED_DAYS より古いペアで定義されるため、これより
+# 若い身元は確立済みが定義上ゼロで「機器らしい」適格判定が空転し、
+# 初日の全面新規がバーストに化ける（2026-11-28、Flint 初日で実証）。
+# 通知は所見として出すが、執行の橋は渡さない。TREND の年齢条件と
+# 同じ考え方。
+BURST_MIN_IDENTITY_AGE_DAYS = ESTABLISHED_DAYS
 INTEL_STALE_HOURS = 48       # インテルリストがこの時間更新されなければ警告
 SELF_IPS = {"127.0.0.1", "::1"}  # リゾルバ自身は検知対象にしない
 
@@ -1423,6 +1430,12 @@ def build_activeban_event(conn, identity, kind, now):
                                    h["count"] for h in hits)}},
                     "baseline": baseline}}
     if kind == "NEW_PAIR_BURST":
+        # 新生身元は橋渡ししない（通知のみ）。first_seen は
+        # _baseline_summary が id_clients から引いたものを使う。
+        # 年齢不明（行なし）も渡さない側に倒す。
+        fs = baseline["first_seen"]
+        if fs is None or fs > now - BURST_MIN_IDENTITY_AGE_DAYS * DAY:
+            return None
         n = conn.execute(
             "SELECT COUNT(*) FROM id_pairs WHERE identity = ? "
             "AND first_seen >= ? AND domain LIKE '%.%'",

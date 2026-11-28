@@ -36,7 +36,7 @@ IP does not inherit another device's history):
 | `NEW_PAIR` | A machine-like device (small destination set) queried a domain it never queried before | No — discovery |
 | `NX_SPIKE` | NXDOMAIN count/ratio jumped far above the device's own baseline (DGA / misconfiguration signature) | **Yes** |
 | `NIGHT` | 00:00–05:00 traffic far above the device's previous busiest night | No (configurable) |
-| `NEW_PAIR_BURST` | A machine-like device touched an abnormal *number* of new destinations in 24 h (one-shot-each spray that per-pair detection misses) | **Yes** (configurable) |
+| `NEW_PAIR_BURST` | A machine-like device touched an abnormal *number* of new destinations in 24 h (one-shot-each spray that per-pair detection misses). Bridge-reported only once the identity is 7+ days old: a younger identity has no established destinations by definition, so its first-day all-new traffic is not a burst (it is still notified) | **Yes** (configurable) |
 | `INTEL` | A destination touched in the last 24 h matches a threat-intel domain list (optional; use high-precision malware/C2/phishing feeds only) | **Yes** (configurable) |
 | `TREND` | Query volume or new-destination count keeps rising across 10-day buckets (slow-drift poisoning that short-window comparisons absorb into the baseline). Machine-like devices only, known for 40+ days | No — notify only |
 | canary | A query for `*.canary.activeban.invalid` | **Yes** (test probe) |
@@ -76,7 +76,10 @@ The main run is a 30-minute batch, so a tripwire signal can wait up to
 30 minutes to be reported. `fastlane.py` is a companion on a 5-minute
 timer that looks only at the last 15 minutes and checks only two
 things: queries for the activeban canary domain, and NXDOMAIN bursts
-(>= 20 NX and >= 50% of a device's queries in the window). It reuses
+(>= 20 NX and >= 50% of a device's queries in the window; the report
+evidence includes the top NX domains and the distinct NX domain
+count, so the verifier can tell OS resolver noise from DGA-shaped
+labels). It reuses
 the same collector and bridge, keeps no baseline state (suppression
 timestamps live in `fastlane_state.json` next to the state database),
 and reports directly; activeban itself announces the resulting bans
