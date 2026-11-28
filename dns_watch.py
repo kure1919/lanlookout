@@ -106,6 +106,12 @@ TREND_DST_BUCKETS = 4        # 宛先種類: 直近 40 日を 4 バケットで�
 TREND_DST_MIN_LAST = 10      # 最終バケットの新規宛先数の下限
 TREND_DST_TOTAL = 3.0        # 最初→最後で最低この倍率
 TREND_SUPPRESS_DAYS = 30     # 同一所見の再通知を抑える日数
+# 「機器らしい」適格は、異常発生前の姿で判定する。直近の窓の宛先数を
+# そのまま数えると、暴れた端末自身が宛先数を押し上げて上限を超え、
+# 検知対象から卒業してしまう（自己除外）。そこで first_seen が
+# ESTABLISHED_DAYS より古い＝確立済みの宛先だけを数える。
+ESTABLISHED_DAYS = 7
+INTEL_STALE_HOURS = 48       # インテルリストがこの時間更新されなければ警告
 SELF_IPS = {"127.0.0.1", "::1"}  # リゾルバ自身は検知対象にしない
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -847,8 +853,11 @@ def check_new_pairs(conn, now, skip_identities=frozenset()):
 
     id_pairs は端末の全 IP 時代を通した履歴なので、DHCP の引っ越しや
     使い回し IP への移動では、既知の宛先が「新規」に化けることはない。
-    「機器らしい」判定の宛先数は直近 new_pair_window_days 日の窓で数える
-    （生涯累計だと、宛先が少しずつ増える IoT が永久に対象外になる）。
+    「機器らしい」判定の宛先数は、直近 new_pair_window_days 日の窓の
+    うち first_seen が ESTABLISHED_DAYS より古い＝確立済みの宛先だけを
+    数える（生涯累計だと、宛先が少しずつ増える IoT が永久に対象外に
+    なる。逆に窓の全数を数えると、暴れた端末が自分の宛先数で上限を
+    超えて検知対象から卒業してしまう＝自己除外）。
     """
     findings = []  # (identity, kind, akey, text)
     rows = conn.execute(
@@ -857,11 +866,13 @@ def check_new_pairs(conn, now, skip_identities=frozenset()):
         WHERE first_seen >= ? AND recent_count >= ?
           AND domain LIKE '%.%'
           AND (SELECT COUNT(*) FROM id_pairs q
-               WHERE q.identity = id_pairs.identity AND q.last_seen >= ?) <= ?
+               WHERE q.identity = id_pairs.identity AND q.last_seen >= ?
+                 AND q.first_seen < ?) <= ?
         ORDER BY identity, recent_count DESC
         """,
         (now - DAY, NEW_PAIR_MIN_COUNT,
          now - CONFIG["new_pair_window_days"] * DAY,
+         now - ESTABLISHED_DAYS * DAY,
          CONFIG["new_pair_max_client_pairs"]),
     ).fetchall()
     by_id = {}
@@ -1115,6 +1126,40 @@ def check_intel(conn, now):
     return findings
 
 
+def check_intel_health(conn, now):
+    """インテルリスト自体の健全性。監視の無言の死を防ぐための警告。
+
+    リストが読めない/空だと INTEL 検知は黙って無効になる（取得失敗時
+    は旧ファイルを守る設計なので、鮮度の劣化も同じ形で現れる）。
+    有効化されているのに使えない状態は、検知の不在ではなく故障と
+    して通知する。警告は1日1回まで（identity="system" で記録）。
+    """
+    findings = []
+    if not CONFIG["intel"]["enabled"]:
+        return findings
+    path = CONFIG["intel"]["path"]
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    if mtime is None or not load_intel_domains():
+        if not already_alerted(conn, "system", "INTEL_HEALTH", "missing",
+                               now, days=1):
+            findings.append(
+                ("system", "INTEL_HEALTH", ["missing"],
+                 "■ 警告: インテルリストが読めない/空のため INTEL 検知が"
+                 "無効です: %s" % path))
+    elif now - mtime > INTEL_STALE_HOURS * 3600:
+        if not already_alerted(conn, "system", "INTEL_HEALTH", "stale",
+                               now, days=1):
+            findings.append(
+                ("system", "INTEL_HEALTH", ["stale"],
+                 "■ 警告: インテルリストが %d 時間更新されていません"
+                 "（intel_fetch のタイマーを確認）"
+                 % int((now - mtime) // 3600)))
+    return findings
+
+
 def check_new_pair_burst(conn, now, skip_identities=frozenset()):
     """新規宛先バースト: 24hの新規宛先の「数」そのものを見る。
 
@@ -1129,11 +1174,13 @@ def check_new_pair_burst(conn, now, skip_identities=frozenset()):
         SELECT identity, COUNT(*) AS n FROM id_pairs
         WHERE first_seen >= ? AND domain LIKE '%.%'
           AND (SELECT COUNT(*) FROM id_pairs q
-               WHERE q.identity = id_pairs.identity AND q.last_seen >= ?) <= ?
+               WHERE q.identity = id_pairs.identity AND q.last_seen >= ?
+                 AND q.first_seen < ?) <= ?
         GROUP BY identity HAVING n >= ?
         ORDER BY n DESC
         """,
         (now - DAY, now - CONFIG["new_pair_window_days"] * DAY,
+         now - ESTABLISHED_DAYS * DAY,
          CONFIG["new_pair_max_client_pairs"],
          CONFIG["new_pair_burst_threshold"]),
     ).fetchall()
@@ -1169,7 +1216,7 @@ def check_trend(conn, now):
 
     短窓 vs 直近平常の比較は、2 週間以上かけた坂を平常側に取り込む。
     ここでは 10 日バケットの傾きそのものを見る。対象は NEW_PAIR と
-    同じ適格（直近ウィンドウの宛先種類が上限以下＝機器らしい端末）
+    同じ適格（確立済みの宛先種類が上限以下＝機器らしい端末）
     かつ、既知になってから TREND_MIN_AGE_DAYS 以上経った端末だけ。
     人の端末は利用の増加が正常なので構造的に入ってこないし、
     新規端末は「ゼロから増えている」ようにしか見えないので年齢で
@@ -1181,8 +1228,9 @@ def check_trend(conn, now):
     cap = CONFIG["new_pair_max_client_pairs"]
     eligible = {r[0] for r in conn.execute(
         "SELECT identity FROM id_pairs WHERE last_seen >= ? "
+        "AND first_seen < ? "
         "GROUP BY identity HAVING COUNT(*) <= ?",
-        (now - window, cap)).fetchall()}
+        (now - window, now - ESTABLISHED_DAYS * DAY, cap)).fetchall()}
     first_seen = dict(conn.execute(
         "SELECT identity, first_seen FROM id_clients").fetchall())
     ignores = CONFIG["ignore_new_pair"]
@@ -1690,6 +1738,7 @@ def run(now, bootstrap=False, dry_run=False):
         findings += check_nx_spike(conn, now)
         findings += check_night(conn, now)
         findings += check_intel(conn, now)
+        findings += check_intel_health(conn, now)
         findings += check_new_pair_burst(
             conn, now,
             skip_identities=new_ids | known_released_identities(conn, now))
