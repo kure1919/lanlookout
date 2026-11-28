@@ -97,10 +97,24 @@ def load_ip_mac():
     return out
 
 
+# ループバックは LAN の端末ではない。本レーンは本線 run() の
+# SELF_IPS フィルタを通らないので、ここで同じ除外を効かせる。
+_NULL_MACS = {"00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff"}
+
+
+def _is_self_ip(ip):
+    return ip in dw.SELF_IPS or ip.startswith("127.")
+
+
 def resolve_mac(ip, info, ip_mac):
     mac = ip_mac.get(ip) or (info.get(ip) or {}).get("mac") or ""
     mac = mac.lower()
-    return mac if dw._MAC_RE.match(mac) else ""
+    if not dw._MAC_RE.match(mac) or mac in _NULL_MACS:
+        # 形式は合っていても全ゼロ/ブロードキャストは端末の MAC では
+        # ない（FTL は 127.0.0.1 の MAC として全ゼロを返す）。
+        # 「解決できない」として扱い、推測で報告しない。
+        return ""
+    return mac
 
 
 # ------------------------------------------------------------------ 検知
@@ -109,6 +123,8 @@ def find_canary(pairs, info, ip_mac, suppressed, now):
     """canary 宛のペアを (mac, ip, name, domain, count) で返す。"""
     out = []
     for (ip, domain), (count, _nx, _f, _l) in pairs.items():
+        if _is_self_ip(ip):
+            continue
         if domain != CANARY_DOMAIN and not domain.endswith("." + CANARY_DOMAIN):
             continue
         mac = resolve_mac(ip, info, ip_mac)
@@ -133,6 +149,8 @@ def find_nx_burst(pairs, info, ip_mac, suppressed, now):
         a[1] += nx
     out = []
     for ip, (total, nx) in per.items():
+        if _is_self_ip(ip):
+            continue
         if nx < NX_BURST_MIN or total == 0 or nx / total < NX_BURST_RATIO:
             continue
         mac = resolve_mac(ip, info, ip_mac)
