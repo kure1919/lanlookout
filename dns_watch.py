@@ -1317,6 +1317,15 @@ def _device_for_identity(conn, identity):
             "SELECT ip FROM ip_mac WHERE mac = ? ORDER BY last_seen DESC LIMIT 1",
             (mac,),
         ).fetchone()
+        if not row:
+            # ip_mac（現在の対応）に無い MAC は、履歴の最新区間から拾う。
+            # 複数インタフェースの端末では現在の行が別 MAC を指していて
+            # ip=None になることがある（実例: 開発用 PC の第2 MAC）。
+            row = conn.execute(
+                "SELECT ip FROM ip_mac_history WHERE upper(mac) = ? "
+                "ORDER BY valid_from DESC LIMIT 1",
+                (mac,),
+            ).fetchone()
         return {"mac": mac, "ip": row[0] if row else None,
                 "name": DEVICE_NAMES.get(mac)}
     return {"mac": None, "ip": identity,
